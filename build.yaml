@@ -1,0 +1,109 @@
+name: Build IPA
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Locate project (supports a source .zip uploaded to the repo root)
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          zips=(*.zip)
+          if [ ${#zips[@]} -gt 0 ]; then
+            echo "Unpacking ${zips[0]}"
+            mkdir -p _src
+            unzip -q -o "${zips[0]}" -d _src
+            root=_src
+          else
+            root=.
+          fi
+          yml=$(find "$root" -name project.yml -not -path '*/.git/*' | head -n 1)
+          if [ -z "$yml" ]; then
+            echo "project.yml not found"
+            exit 1
+          fi
+          echo "PROJECT_DIR=$(dirname "$yml")" >> "$GITHUB_ENV"
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate Xcode project
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: xcodegen generate
+
+      - name: Build unsigned archive
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          set -o pipefail
+          xcodebuild archive \
+            -project IQDownloader.xcodeproj \
+            -scheme IQDownloader \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -archivePath "$RUNNER_TEMP/IQDownloader.xcarchive" \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            2>&1 | tee "$RUNNER_TEMP/build.log"
+
+      - name: Show build errors
+        if: failure()
+        run: |
+          echo "=== Errors ==="
+          grep -E "error:|ARCHIVE FAILED" "$RUNNER_TEMP/build.log" | sort -u | head -40 || true
+
+      - name: Upload build log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: ${{ runner.temp }}/build.log
+
+      - name: Package IPA
+        run: |
+          set -euo pipefail
+          APP=$(find "$RUNNER_TEMP/IQDownloader.xcarchive/Products/Applications" -maxdepth 1 -name '*.app' | head -n 1)
+          mkdir -p "$RUNNER_TEMP/ipa/Payload"
+          cp -R "$APP" "$RUNNER_TEMP/ipa/Payload/"
+          (cd "$RUNNER_TEMP/ipa" && zip -qry "$GITHUB_WORKSPACE/IQDownloader.ipa" Payload)
+          ls -lh "$GITHUB_WORKSPACE/IQDownloader.ipa"
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: IQDownloader-ipa
+          path: IQDownloader.ipa
+
+      - name: Publish release (direct .ipa download link)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: IQ Downloader build ${{ github.run_number }}
+          body: ملف IPA غير موقّع. افتحه عبر SideStore لتوقيعه وتثبيته.
+          files: IQDownloader.ipa
+
+      - name: Run unit tests (does not block the IPA)
+        continue-on-error: true
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          set -o pipefail
+          UDID=$(xcrun simctl list devices available -j | python3 -c "
+          import json, sys
+          data = json.load(sys.stdin)['devices']
+          print(next(d['udid'] for runtime, devs in data.items() if 'iOS' in runtime for d in devs if 'iPhone' in d['name']))
+          ")
+          echo "Simulator: $UDID"
+          xcodebuild test \
+            -project IQDownloader.xcodeproj \
+            -scheme IQDownloader \
+            -destination "id=$UDID" \
+            CODE_SIGNING_ALLOWED=NO 2>&1 | tail -n 60
